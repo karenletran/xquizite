@@ -1,0 +1,90 @@
+name: Fresha price sync
+
+# Every morning at 6:00 AM Bahrain time (3:00 UTC), and on demand from the Actions tab.
+on:
+  schedule:
+    - cron: "0 3 * * *"
+  workflow_dispatch:
+    inputs:
+      test_override:
+        description: "TEST ONLY: pretend Fresha shows a price, e.g. 26218100:4 (Fresha ID:price). Leave empty for a real run."
+        required: false
+        default: ""
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+
+concurrency:
+  group: fresha-price-sync
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      SYNC_BRANCH: ${{ inputs.test_override != '' && 'fresha-price-sync-test' || 'fresha-price-sync' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Compare Fresha prices with the website
+        id: sync
+        env:
+          TEST_OVERRIDE: ${{ inputs.test_override }}
+        run: python scripts/sync_prices.py --report "$RUNNER_TEMP/report.md" | tee -a "$GITHUB_OUTPUT"
+
+      - name: Show the report
+        run: cat "$RUNNER_TEMP/report.md" >> "$GITHUB_STEP_SUMMARY"
+
+      # Price changes: open (or refresh) ONE pull request for the owner to approve.
+      # Nothing reaches the live site until the owner presses "Merge".
+      - name: Ask the owner to approve the price changes
+        if: steps.sync.outputs.status == 'changes'
+        run: |
+          git config user.name "XQUIZITE price sync"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git switch -C "$SYNC_BRANCH"
+          git add index.html
+          git commit -m "Update website prices from Fresha"
+          git push --force origin "$SYNC_BRANCH"
+          {
+            cat "$RUNNER_TEMP/report.md"
+            echo
+            echo "---"
+            echo "@karenletran these prices changed on Fresha. **Press \"Merge pull request\" to publish them on xquizitesalon.com** (live about 20 seconds later). If something looks wrong, close this without merging and the website stays as it is."
+          } > "$RUNNER_TEMP/pr.md"
+          TITLE="Approve website price update from Fresha"
+          [ -n "${{ inputs.test_override }}" ] && TITLE="TEST - $TITLE (do not merge)"
+          if gh pr view "$SYNC_BRANCH" --json state -q .state 2>/dev/null | grep -q OPEN; then
+            gh pr edit "$SYNC_BRANCH" --title "$TITLE" --body-file "$RUNNER_TEMP/pr.md"
+          else
+            gh pr create --base main --head "$SYNC_BRANCH" --title "$TITLE" --body-file "$RUNNER_TEMP/pr.md"
+          fi
+
+      - name: Close the attention note once everything is fine again
+        if: steps.sync.outputs.status == 'ok' || steps.sync.outputs.status == 'changes'
+        run: |
+          NUM=$(gh issue list --state open --search "in:title \"Website prices: Fresha check needs attention\"" --json number -q '.[0].number')
+          [ -z "$NUM" ] || gh issue close "$NUM" --comment "Resolved: website and Fresha match again ($(date -u +%Y-%m-%d))."
+
+      # New/removed services, unclear prices, or a safety stop: one open issue, updated, never duplicated.
+      - name: Tell the owner something needs a person
+        if: steps.sync.outputs.status == 'attention' || steps.sync.outputs.status == 'stop'
+        run: |
+          TITLE="Website prices: Fresha check needs attention"
+          { cat "$RUNNER_TEMP/report.md"; echo; echo "@karenletran no prices were changed on the website. Ask Claude to fix the items above."; } > "$RUNNER_TEMP/issue.md"
+          NUM=$(gh issue list --state open --search "in:title \"$TITLE\"" --json number -q '.[0].number')
+          if [ -n "$NUM" ]; then
+            if ! gh issue view "$NUM" --json body -q .body | cmp -s - "$RUNNER_TEMP/issue.md"; then
+              gh issue edit "$NUM" --body-file "$RUNNER_TEMP/issue.md"
+              gh issue comment "$NUM" --body "Updated by the $(date -u +%Y-%m-%d) check."
+            fi
+          else
+            gh issue create --title "$TITLE" --body-file "$RUNNER_TEMP/issue.md"
+          fi
